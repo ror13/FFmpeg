@@ -64,8 +64,11 @@ typedef struct HTTPContext {
     unsigned char buffer[BUFFER_SIZE], *buf_ptr, *buf_end;
     int line_count;
     int http_code;
+    /* WebSocket impl field */
+    uint64_t websocket_payload_left;
     /* Used if "Transfer-Encoding: chunked" otherwise -1. */
     uint64_t chunksize;
+    int chunkend;
     uint64_t off, end_off, filesize;
     char *location;
     HTTPAuthState auth_state;
@@ -77,6 +80,8 @@ typedef struct HTTPContext {
 #if FF_API_HTTP_USER_AGENT
     char *user_agent_deprecated;
 #endif
+    char *ws_login;
+    char *ws_password;
     char *content_type;
     /* Set if the server correctly handles Connection: close and will close
      * the connection after feeding us the content. */
@@ -156,6 +161,8 @@ static const AVOption options[] = {
     { "offset", "initial byte offset", OFFSET(off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "end_offset", "try to limit the request to bytes preceding this offset", OFFSET(end_off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "method", "Override the HTTP method or set the expected HTTP method from a client", OFFSET(method), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
+    { "ws_login", "Set login for connect to Kipod server", OFFSET(ws_login), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
+    { "ws_password", "Set password for connect to Kipod server", OFFSET(ws_password), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "reconnect_at_eof", "auto reconnect at EOF", OFFSET(reconnect_at_eof), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "reconnect_streamed", "auto reconnect streamed / non seekable streams", OFFSET(reconnect_streamed), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
@@ -1341,6 +1348,113 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
     return len;
 }
 
+static int ws_buf_read(URLContext *h, uint8_t *buf, int size)
+{
+    HTTPContext *s = h->priv_data;
+    int len;
+
+    if (s->chunksize != UINT64_MAX) {
+        if (s->chunkend) {
+            return AVERROR_EOF;
+        }
+        if (!s->chunksize) {
+            char line[32];
+            int err;
+
+            do {
+                if ((err = http_get_line(s, line, sizeof(line))) < 0)
+                    return err;
+            } while (!*line);    /* skip CR LF from last chunk */
+
+            s->chunksize = strtoull(line, NULL, 16);
+
+            av_log(h, AV_LOG_TRACE,
+                   "Chunked encoding data size: %"PRIu64"\n",
+                    s->chunksize);
+
+            if (!s->chunksize && s->multiple_requests) {
+                http_get_line(s, line, sizeof(line)); // read empty chunk
+                s->chunkend = 1;
+                return 0;
+            }
+            else if (!s->chunksize) {
+                av_log(h, AV_LOG_DEBUG, "Last chunk received, closing conn\n");
+                ffurl_closep(&s->hd);
+                return 0;
+            }
+            else if (s->chunksize == UINT64_MAX) {
+                av_log(h, AV_LOG_ERROR, "Invalid chunk size %"PRIu64"\n",
+                       s->chunksize);
+                return AVERROR(EINVAL);
+            }
+        }
+        size = FFMIN(size, s->chunksize);
+    }
+
+    /* read bytes from input buffer first */
+    len = s->buf_end - s->buf_ptr;
+    if (len > 0) {
+        if (len > size)
+            len = size;
+        memcpy(buf, s->buf_ptr, len);
+        s->buf_ptr += len;
+    } else {
+        uint64_t target_end = s->end_off ? s->end_off : s->filesize;
+        if ((!s->willclose || s->chunksize == UINT64_MAX) && s->off >= target_end)
+            return AVERROR_EOF;
+        len = ffurl_read(s->hd, buf, size);
+        if (!len && (!s->willclose || s->chunksize == UINT64_MAX) && s->off < target_end) {
+            av_log(h, AV_LOG_ERROR,
+                   "Stream ends prematurely at %"PRIu64", should be %"PRIu64"\n",
+                   s->off, target_end
+                  );
+            return AVERROR(EIO);
+        }
+    }
+    if (len > 0) {
+        s->off += len;
+        if (s->chunksize > 0 && s->chunksize != UINT64_MAX) {
+            av_assert0(s->chunksize >= len);
+            s->chunksize -= len;
+        }
+    }
+
+    if (len <= s->websocket_payload_left) {
+     s->websocket_payload_left -= len;
+     return len;
+    }
+
+    for (int pos=s->websocket_payload_left; pos < len; pos++) {
+     // TODO: Don't read outside buffer
+     if (buf[pos] == 0x82 && (buf[pos+1]==126 || buf[pos+1]==127)) {
+       unsigned short ws_header_length = 2;
+       unsigned short payload_val_length = 2;
+       uint64_t payload_length = 0;
+       if (buf[pos+1] == 127) { // extended payload length 64 bit
+         payload_val_length = 8;
+       }
+       for (int i=0;i<payload_val_length;i++) {
+         payload_length = (payload_length<<8) + buf[pos+ws_header_length+i];
+       }
+       int trim_bytes = ws_header_length+payload_val_length;
+       int move_bytes = len - pos - trim_bytes;
+       if (move_bytes < 0) {
+         move_bytes = 0;
+       }
+       if (move_bytes < payload_length) {
+         s->websocket_payload_left = payload_length - move_bytes;
+       } else {
+         s->websocket_payload_left = 0;
+       }
+       memmove(buf+pos, buf+pos+trim_bytes, move_bytes);
+       len -= trim_bytes;
+       pos+= payload_length > move_bytes ? move_bytes : payload_length;
+       pos--;
+     }
+    }
+    return len;
+}
+
 #if CONFIG_ZLIB
 #define DECOMPRESS_BUF_SIZE (256 * 1024)
 static int http_buf_read_compressed(URLContext *h, uint8_t *buf, int size)
@@ -1645,6 +1759,146 @@ static int http_get_short_seek(URLContext *h)
     return ffurl_get_short_seek(s->hd);
 }
 
+static int ws_open(URLContext *h, const char *uri, int flags,
+                     AVDictionary **options)
+{
+
+    HTTPContext *internal = h->priv_data;
+    URLContext *ctx = NULL;
+    AVDictionary *d = NULL;
+    int err = 0;
+    int port;
+
+    const size_t max_uri_len = strlen(uri) + 1024;
+
+    char* headers_ext = NULL;
+    char* mesage = NULL;
+    char* post_data = NULL;
+    char* host_origin = av_malloc(max_uri_len);
+    char* hostname = av_malloc(max_uri_len);
+    char* host_auth = av_malloc(max_uri_len);
+    char* auth = av_malloc(max_uri_len);
+    char* pathbuf = av_malloc(max_uri_len);
+
+    av_url_split(NULL, 0, auth, max_uri_len, hostname, max_uri_len, &port,
+                 pathbuf, max_uri_len, uri);
+    ff_url_join(host_origin, max_uri_len, "http", NULL, hostname, port, NULL);
+    ff_url_join(host_auth, max_uri_len, "http", NULL, hostname, port, "/edge-api/api/v1/users/login");
+
+    if(internal->ws_login == NULL && strlen(auth)){
+        char * ch = strchr(auth,':');
+        if(ch){
+            internal->ws_login = av_strndup(auth, ch - auth);
+        }else{
+            internal->ws_login = av_strdup(auth);
+        }
+    }
+    if(internal->ws_password == NULL && strlen(auth)){
+        char * ch = strchr(auth,':');
+        if(ch){
+            internal->ws_password = av_strdup(++ch);
+        }
+    }
+
+    const char * headers_template = "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Origin: %s\r\n"
+                           "Sec-WebSocket-Key: cjTrHmpILrlQfTMn44i4LA==\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\0";
+
+    headers_ext = av_malloc(strlen(headers_template)+strlen(host_origin)+2);
+    sprintf(headers_ext,headers_template,host_origin);
+
+    size_t header_len = 0;
+    if(internal->headers != NULL){
+        header_len = strlen(internal->headers);
+        if(header_len >= 2 && strcmp("\r\n", internal->headers + header_len - 2) != 0) {
+            err = av_reallocp(&internal->headers, header_len + 3);
+            if(err < 0){
+                av_log(h, AV_LOG_ERROR, "can't realloc headers for replace chars\n");
+                goto done;
+            }
+            internal->headers[header_len]     = '\r';
+            internal->headers[header_len + 1] = '\n';
+            internal->headers[header_len + 2] = '\0';
+        }
+
+        header_len = strlen(internal->headers);
+    }
+
+    err = av_reallocp(&internal->headers, header_len + strlen(headers_ext));
+    if(err < 0){
+        av_log(h, AV_LOG_ERROR, "can't realloc headers for ext header\n");
+        goto done;
+    }
+    strcat(internal->headers, headers_ext);
+
+    if(internal->ws_login == NULL || internal->ws_password == NULL){
+        av_log(h, AV_LOG_INFO, "Login or Password nil. Started without auth\n");
+        goto done;
+    }
+
+    av_log(h, AV_LOG_TRACE, "AUTH [%s]  ws_login [%s] ws_login [%s]\n", auth, internal->ws_login, internal->ws_password);
+
+    mesage = av_malloc(512 + strlen(internal->ws_login) + strlen(internal->ws_password));
+
+    sprintf(mesage,
+            "{\"name\": \"%s\",\"password\": \"%s\",  \"rememberme\": false,\"rememberme_infinite\": true}",
+            internal->ws_login, internal->ws_password);
+    post_data = av_malloc(strlen(mesage)*2+2);
+    ff_data_to_hex(post_data,mesage,strlen(mesage),0);
+    av_log(h, AV_LOG_TRACE, "post_data json[%s]\n post_data hexstr[%s]\n", mesage, post_data);
+
+    av_dict_set(&d, "content_type", "application/json", 0);
+    av_dict_set(&d, "post_data", post_data, 0);
+    err = ffurl_open(&ctx, host_auth, AVIO_FLAG_READ_WRITE, NULL, &d);
+    av_dict_free(&d);
+
+    if(err < 0){
+        av_log(h, AV_LOG_ERROR, "can't authorize to kipod server\n");
+        goto done;
+    }
+
+    HTTPContext *result = ctx->priv_data;
+    if(result != NULL){
+        if(internal->cookies == NULL){
+            internal->cookies = av_strdup(result->cookies);
+        }else{
+            char* new_cookies = av_malloc(strlen(result->cookies)+strlen(internal->cookies)+3);
+            sprintf(new_cookies,"%s; %s" , internal->cookies, result->cookies);
+            av_freep(&internal->cookies);
+            internal->cookies = new_cookies;
+        }
+    }
+
+    if(ctx)
+        ffurl_closep(&ctx);
+
+done:
+    if(headers_ext){
+        av_freep(&headers_ext);
+    }
+    if(mesage){
+        av_freep(&mesage);
+    }
+    if(post_data){
+        av_freep(&post_data);
+    }
+
+    av_freep(&host_origin);
+    av_freep(&hostname);
+    av_freep(&host_auth);
+    av_freep(&auth);
+    av_freep(&pathbuf);
+
+    if(err < 0)
+        return err;
+    return http_open(h,uri,flags,options);
+
+
+
+}
+
 #define HTTP_CLASS(flavor)                          \
 static const AVClass flavor ## _context_class = {   \
     .class_name = # flavor,                         \
@@ -1672,6 +1926,25 @@ const URLProtocol ff_http_protocol = {
     .priv_data_class     = &http_context_class,
     .flags               = URL_PROTOCOL_FLAG_NETWORK,
     .default_whitelist   = "http,https,tls,rtp,tcp,udp,crypto,httpproxy"
+};
+
+HTTP_CLASS(ws);
+const URLProtocol ff_ws_protocol = {
+    .name                = "ws",
+    .url_open2           = ws_open,
+    .url_accept          = http_accept,
+    .url_handshake       = http_handshake,
+    .url_read            = ws_buf_read,
+    .url_write           = http_write,
+    .url_seek            = http_seek,
+    .url_close           = http_close,
+    .url_get_file_handle = http_get_file_handle,
+    .url_get_short_seek  = http_get_short_seek,
+    .url_shutdown        = http_shutdown,
+    .priv_data_size      = sizeof(HTTPContext),
+    .priv_data_class     = &ws_context_class,
+    .flags               = URL_PROTOCOL_FLAG_NETWORK,
+    .default_whitelist   = "ws,tcp,udp,tls"
 };
 #endif /* CONFIG_HTTP_PROTOCOL */
 

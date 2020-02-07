@@ -36,6 +36,7 @@ extern const URLProtocol ff_ftp_protocol;
 extern const URLProtocol ff_gopher_protocol;
 extern const URLProtocol ff_hls_protocol;
 extern const URLProtocol ff_http_protocol;
+extern const URLProtocol ff_ws_protocol;
 extern const URLProtocol ff_httpproxy_protocol;
 extern const URLProtocol ff_https_protocol;
 extern const URLProtocol ff_icecast_protocol;

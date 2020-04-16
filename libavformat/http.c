@@ -1831,7 +1831,7 @@ static int ws_open(URLContext *h, const char *uri, int flags,
         av_log(h, AV_LOG_ERROR, "can't realloc headers for ext header\n");
         goto done;
     }
-    strcat(internal->headers, headers_ext);
+    memcpy(internal->headers + header_len, headers_ext, strlen(headers_ext));
 
     if(internal->ws_login == NULL || internal->ws_password == NULL){
         av_log(h, AV_LOG_INFO, "Login or Password nil. Started without auth\n");

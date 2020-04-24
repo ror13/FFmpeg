@@ -1762,13 +1762,14 @@ static int http_get_short_seek(URLContext *h)
 static int ws_open(URLContext *h, const char *uri, int flags,
                      AVDictionary **options)
 {
+    h->max_packet_size = 1024*1024*10; // shoud be more than one MOV segment. (using in function ffio_fdopen, source aviobuf.c )
 
     HTTPContext *internal = h->priv_data;
     URLContext *ctx = NULL;
     AVDictionary *d = NULL;
     int err = 0;
     int port;
-
+    
     const size_t max_uri_len = strlen(uri) + 1024;
 
     char* headers_ext = NULL;
